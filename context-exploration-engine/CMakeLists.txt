@@ -8,6 +8,13 @@ set(CLIO_CEE_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 message(STATUS "Context Exploration Engine: Building API components")
 add_subdirectory(api)
 
+# Agent-interceptor: LLM tool-call interception/tracking ChiMods (ported from
+# clio-core-dtio-old). Gated on CLIO_CORE_ENABLE_CEE like the rest of CEE.
+if(CLIO_CORE_ENABLE_CEE)
+  message(STATUS "Context Exploration Engine: Building agent-interceptor")
+  add_subdirectory(agent-interceptor)
+endif()
+
 # hdf-compass and mcp-hdf-demo are standalone components
 message(STATUS "  hdf-compass and mcp-hdf-demo are standalone components")
 message(STATUS "  To build them, navigate to their respective directories")

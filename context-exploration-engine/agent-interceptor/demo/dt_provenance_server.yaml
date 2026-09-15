@@ -1,0 +1,82 @@
+# DTProvenance Server Configuration
+# Complete runtime config: base CLIO runtime + DTProvenance ChiMods
+# Ported from clio-core-dtio-old (chimaera -> clio rename); mod_name values
+# below are each module's CreateParams::chimod_lib_name (verified against the
+# ported source, not guessed from clio_mod.yaml's module_name field alone).
+
+networking:
+  port: 9513
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+
+compose:
+  # Block device (required by the CLIO runtime)
+  - mod_name: clio_bdev
+    pool_name: "ram::clio_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "256MB"
+
+  # CTE for context storage
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "256MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: 1
+
+  # HTTP Proxy — receives agent requests on port 9090
+  - mod_name: dt_provenance_dt_proxy
+    pool_name: dt_proxy_pool
+    pool_query: local
+    pool_id: "800.0"
+    config: |
+      port: 9090
+      num_threads: 8
+
+  # Anthropic Interception
+  - mod_name: dt_provenance_dt_intercept_anthropic
+    pool_name: dt_intercept_anthropic_pool
+    pool_query: local
+    pool_id: "801.0"
+    config: |
+      upstream_base_url: "https://api.anthropic.com"
+
+  # OpenAI Interception
+  - mod_name: dt_provenance_dt_intercept_openai
+    pool_name: dt_intercept_openai_pool
+    pool_query: local
+    pool_id: "802.0"
+    config: |
+      upstream_base_url: "https://api.openai.com"
+
+  # Ollama Interception — matches the local Ollama server SWE-bench's
+  # agent/run_agent.py already talks to on this cluster.
+  - mod_name: dt_provenance_dt_intercept_ollama
+    pool_name: dt_intercept_ollama_pool
+    pool_query: local
+    pool_id: "803.0"
+    config: |
+      upstream_base_url: "http://localhost:11434"
+
+  # Conversation Tracker
+  - mod_name: dt_provenance_dt_tracker
+    pool_name: dt_tracker_pool
+    pool_query: local
+    pool_id: "810.0"
+
+  # Context Untangler — computes diffs, writes Ctx_graph_<session_id> CTE tags
+  - mod_name: dt_provenance_dt_ctx_untangler
+    pool_name: dt_ctx_untangler_pool
+    pool_query: local
+    pool_id: "820.0"

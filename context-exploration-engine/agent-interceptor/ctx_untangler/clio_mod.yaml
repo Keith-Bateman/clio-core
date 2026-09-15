@@ -1,0 +1,18 @@
+# DTProvenance Context Untangler ChiMod
+# Eagerly computes diffs when interactions arrive.
+# Stores diff nodes in sister CTE buckets (Ctx_graph_<session_id>).
+module_name: dt_ctx_untangler
+namespace: dt_provenance
+version: 0.1.0
+
+# Inherited methods (fixed IDs)
+kCreate: 0
+kDestroy: 1
+kNodeFailure: -1
+kRecover: -1
+kMigrate: -1
+kUpgrade: -1
+kMonitor: 9
+
+# Custom methods
+kComputeDiff: 10

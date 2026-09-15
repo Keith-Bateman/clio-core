@@ -1,0 +1,26 @@
+# DTProvenance Agent-Interceptor Repository Configuration
+# Ported from clio-core-dtio-old/context-exploration-engine/agent-interceptor
+# (chimaera -> clio rename). Nested under context-exploration-engine/, which
+# has its own clio_repo.yaml declaring `modules: []` (CEE itself is a plain
+# API library, not a ChiMod repo) -- this nested file scopes the dt_provenance
+# namespace to everything under this directory without changing that.
+
+name: agent-interceptor
+namespace: dt_provenance
+version: 0.1.0
+description: LLM agent tool-call interception, tracking, and provenance ChiMods
+
+author: Clio Project
+license: BSD-3-Clause
+
+modules:
+  - proxy
+  - tracker
+  - ctx_untangler
+  - intercept_anthropic
+  - intercept_openai
+  - intercept_ollama
+
+build:
+  requires_clio_run: true
+  min_clio_run_version: 1.0.0

@@ -1,0 +1,20 @@
+# DTProvenance Conversation Tracker ChiMod
+# Stores interaction records in CTE using Tag/Blob model.
+module_name: dt_tracker
+namespace: dt_provenance
+version: 0.1.0
+
+# Inherited methods (fixed IDs)
+kCreate: 0
+kDestroy: 1
+kNodeFailure: -1
+kRecover: -1
+kMigrate: -1
+kUpgrade: -1
+kMonitor: 9
+
+# Custom methods
+kStoreInteraction: 10
+kQuerySession: 11
+kListSessions: 12
+kGetInteraction: 13

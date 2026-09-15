@@ -1,0 +1,18 @@
+# DTProvenance HTTP Proxy ChiMod
+# Receives HTTP requests on port 9090, extracts sessions,
+# detects providers, and dispatches to interception ChiMods.
+module_name: dt_proxy
+namespace: dt_provenance
+version: 0.1.0
+
+# Inherited methods (fixed IDs)
+kCreate: 0
+kDestroy: 1
+kNodeFailure: -1
+kRecover: -1
+kMigrate: -1
+kUpgrade: -1
+kMonitor: 9
+
+# Custom methods
+kForwardHttp: 10
