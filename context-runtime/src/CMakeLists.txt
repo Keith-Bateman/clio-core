@@ -64,7 +64,7 @@ if(CLIO_GPU_SOURCES)
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include
+        ${CLIO_CTP_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
@@ -73,7 +73,7 @@ if(CLIO_GPU_SOURCES)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+      "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     )
@@ -89,7 +89,7 @@ if(CLIO_GPU_SOURCES)
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include
+        ${CLIO_CTP_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
@@ -98,7 +98,7 @@ if(CLIO_GPU_SOURCES)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+      "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     )
@@ -126,7 +126,7 @@ if(CLIO_GPU_SOURCES)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+      "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     )
@@ -150,11 +150,11 @@ endif()
 
 # Set include directories as PUBLIC so they propagate to consumers
 # Use CMAKE_CURRENT_SOURCE_DIR/.. to get runtime directory (this is runtime/src)
-# Also include clio_ctp headers which are in context-transport-primitives/include
+# Also include the clio_ctp headers (one include dir per CTP module)
 target_include_directories(${CLIO_LIB_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+  "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
   $<INSTALL_INTERFACE:include>
 )
 
@@ -228,6 +228,23 @@ target_link_libraries(${CLIO_LIB_NAME}
     ctp::lightbeam  # For ZMQ transport
     # chimods_admin_client  # Admin client library for global task routing - TODO: Enable when admin chimod is built
 )
+
+# Poco::Net powers the web dashboard's HTTP server (src/viz, issue #990).
+#
+# PRIVATE for the same reason clio_ctp_host links it privately: Poco::Foundation
+# exports INTERFACE compile definitions (_FILE_OFFSET_BITS=64 /
+# _LARGEFILE64_SOURCE) that make glibc alias open() -> open64() in every
+# consumer, colliding with the POSIX interception adapters that define open64 /
+# creat64 themselves. All Poco use is confined to viz_server.cc; the installed
+# headers never mention a Poco type. CLIO_RUN_HAS_POCO is PUBLIC so ChiMods and
+# tests can #if on whether a dashboard exists in this build.
+if(Poco_FOUND)
+  clio_link_poco_private(${CLIO_LIB_NAME})
+  target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_RUN_HAS_POCO=1)
+else()
+  target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_RUN_HAS_POCO=0)
+  message(STATUS "Web dashboard (viz): DISABLED (Poco::Net not found)")
+endif()
 
 # Set target properties
 set_target_properties(${CLIO_LIB_NAME} PROPERTIES

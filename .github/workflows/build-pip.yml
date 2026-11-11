@@ -19,6 +19,7 @@ on:
       - '.github/workflows/build-pip.yml'
       - 'CMakeLists.txt'
       - 'context-transfer-engine/adapter/libfuse/**'
+      - 'context-transfer-engine/wrapper/python/**'
 
 permissions:
   contents: write
@@ -36,6 +37,7 @@ jobs:
   check-version:
     name: Check tag matches version
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
     - name: Checkout repository
@@ -78,7 +80,7 @@ jobs:
         include:
           - runner: ubuntu-latest
             arch: x86_64
-            cibw_build: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
+            cibw_build: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64"
             cibw_image: manylinux_2_28
             cibw_environment: >-
               CMAKE_PREFIX_PATH=/usr/local
@@ -87,7 +89,7 @@ jobs:
               CXXFLAGS=-march=x86-64
           - runner: ubuntu-24.04-arm
             arch: aarch64
-            cibw_build: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64"
+            cibw_build: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64 cp314-manylinux_aarch64"
             cibw_image: manylinux_2_28
             cibw_environment: >-
               CMAKE_PREFIX_PATH=/usr/local
@@ -106,7 +108,7 @@ jobs:
         python-version: '3.12'
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build wheels
       env:
@@ -119,7 +121,7 @@ jobs:
         # does not bundle libfuse3.so.3 — end users get it from their
         # distro's fuse3 packages.
         CIBW_BEFORE_ALL: >
-          yum install -y curl patchelf fuse3-devel &&
+          yum install -y curl patchelf fuse3-devel openssl-devel &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
@@ -146,12 +148,107 @@ jobs:
         path: installers/pip/wheelhouse/*.whl
 
   #------------------------------------------------------------
+  # GPU wheel variants (Linux x86_64, manylinux_2_28)
+  #
+  # Published as separate distributions that install the same iowarp_core
+  # package: iowarp-core-cuda12, iowarp-core-rocm6, iowarp-core-sycl. The
+  # variant's CMake defines (backend + fat architecture list) are in the
+  # CLIO_WHEEL_GPU overrides at the bottom of pyproject.toml;
+  # installers/pip/gpu_variant.py renames the distribution and adds its
+  # runtime dependency; install_gpu_toolchain.sh installs the compiler in
+  # the manylinux image. One job per (variant, Python): a fat GPU build is
+  # ~5x a CPU build, and five of them serially do not fit a job's time limit.
+  # The import test runs in the build container (no GPU), so it checks that
+  # the wheel loads, not that kernels run.
+  #------------------------------------------------------------
+  build-wheels-gpu:
+    name: GPU wheel (${{ matrix.variant }}, ${{ matrix.py }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [cuda12, rocm6, sycl]
+        py: [cp310, cp311, cp312, cp313, cp314]
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL
+        df -h /
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
+
+    - name: Select GPU variant
+      run: python3 installers/pip/gpu_variant.py ${{ matrix.variant }}
+
+    - name: Build wheel
+      env:
+        CIBW_BUILD: ${{ matrix.py }}-manylinux_x86_64
+        CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+        CIBW_BEFORE_ALL: >
+          yum install -y curl patchelf fuse3-devel openssl-devel &&
+          bash {project}/installers/pip/install_gpu_toolchain.sh ${{ matrix.variant }} &&
+          bash {project}/installers/pip/build_deps_manylinux.sh
+        # The icx/icpx and nvcc paths need oneAPI's environment and CUDA on
+        # PATH; harmless for the other variants.
+        CIBW_ENVIRONMENT: >-
+          CLIO_WHEEL_GPU=${{ matrix.variant }}
+          CMAKE_PREFIX_PATH=/usr/local
+          PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
+          CFLAGS=-march=x86-64
+          CXXFLAGS=-march=x86-64
+          PATH=/opt/intel/oneapi/compiler/latest/bin:/usr/local/cuda-12.9/bin:/opt/rocm/bin:$PATH
+          LD_LIBRARY_PATH=/opt/intel/oneapi/compiler/latest/lib:/opt/rocm/lib:$LD_LIBRARY_PATH
+          LIBRARY_PATH=/usr/local/cuda-12.9/lib64/stubs
+        CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+          bash {project}/installers/pip/repair_wheel.sh {dest_dir} {wheel} manylinux_2_28
+        # The CUDA stubs dir supplies libcuda.so.1 for this GPU-less import
+        # test only (see install_gpu_toolchain.sh); absent for other variants.
+        CIBW_TEST_COMMAND: >
+          LD_LIBRARY_PATH=/usr/local/cuda-12.9/lib64/stubs:$LD_LIBRARY_PATH
+          python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
+      run: cibuildwheel --output-dir installers/pip/wheelhouse
+
+    - name: Verify wheel glibc requirements match the platform tag
+      run: python3 installers/pip/check_wheel_glibc.py installers/pip/wheelhouse/*.whl
+
+    - name: Report wheel size
+      # PyPI's default per-file limit is 100 MB; fat GPU binaries can exceed
+      # it, which needs a limit increase on the PyPI project before release.
+      run: ls -lh installers/pip/wheelhouse/
+
+    - name: Upload wheel
+      uses: actions/upload-artifact@v4
+      with:
+        name: wheels-gpu-${{ matrix.variant }}-${{ matrix.py }}
+        path: installers/pip/wheelhouse/*.whl
+
+  #------------------------------------------------------------
   # Build Windows wheels via cibuildwheel
   #------------------------------------------------------------
   build-wheels-windows:
-    name: Build Windows wheels
+    name: Build Windows wheels (${{ matrix.abi }})
     runs-on: windows-latest
-    timeout-minutes: 120
+    # Each ABI keeps the existing development budget for cold dependencies;
+    # a cold vcpkg cache adds ~24 min building Poco and OpenSSL (#1261).
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
     - name: Checkout repository
@@ -171,23 +268,54 @@ jobs:
         git pull
         .\bootstrap-vcpkg.bat
 
+    # vcpkg builds every port from source; Poco + OpenSSL alone take ~24 min.
+    # Cache the built packages. vcpkg keys each package by its own ABI hash,
+    # so a stale cache only costs rebuilds, never wrong binaries. Saved right
+    # after the install so a later failing step still keeps the cache.
+    - name: Restore vcpkg binary cache
+      id: vcpkg-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/vcpkg-bincache
+        key: vcpkg-bin-x64-windows-${{ hashFiles('.github/workflows/build-pip.yml') }}
+        restore-keys: vcpkg-bin-x64-windows-
+
     - name: Install vcpkg dependencies
+      env:
+        VCPKG_BINARY_SOURCES: clear;files,${{ runner.temp }}/vcpkg-bincache,readwrite
       run: |
-        C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c
+        New-Item -ItemType Directory -Force "${{ runner.temp }}/vcpkg-bincache" | Out-Null
+        C:/vcpkg/vcpkg install --triplet x64-windows zeromq yaml-cpp cereal msgpack-c "poco[net,netssl,crypto,json]"
+
+    - name: Save vcpkg binary cache
+      if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/vcpkg-bincache
+        key: vcpkg-bin-x64-windows-${{ hashFiles('.github/workflows/build-pip.yml') }}
 
     # WinFsp provides the FUSE3-compatible SDK the Windows fuse adapter
     # builds against (#899; see adapter/libfuse/CMakeLists.txt). The choco
     # package installs to %ProgramFiles(x86)%\WinFsp, which is the CMake
     # default search path.
+    # Retry transient registry failures, then ASSERT the SDK is really there:
+    # choco has been observed to exit 0 on a community-feed 503 ("Unable to
+    # find package 'winfsp'"), after which the wheel silently built WITHOUT
+    # clio_cte_fuse.exe and the miss only surfaced ~40 minutes later in the
+    # test job, far from the cause (#1004).
     - name: Install WinFsp (FUSE adapter SDK)
-      run: choco install winfsp -y --no-progress
+      run: |
+        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
+        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+          throw "WinFsp SDK missing after the install succeeded -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
+        }
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build Windows wheels
       env:
-        CIBW_BUILD: "cp310-win_amd64 cp311-win_amd64 cp312-win_amd64 cp313-win_amd64"
+        CIBW_BUILD: "${{ matrix.abi }}-win_amd64"
         CIBW_ENVIRONMENT_WINDOWS: >-
           CMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
           VCPKG_DEFAULT_TRIPLET=x64-windows
@@ -213,7 +341,7 @@ jobs:
     - name: Upload Windows wheels
       uses: actions/upload-artifact@v4
       with:
-        name: wheels-win_amd64
+        name: wheels-win_amd64-${{ matrix.abi }}
         path: installers/pip/wheelhouse/*.whl
 
   #------------------------------------------------------------
@@ -235,18 +363,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Pin to macos-14 (Apple Silicon, macOS 14 Sonoma host). macos-latest
-          # is currently macos-15, where Homebrew bottles target macOS 15.0,
-          # which forces every bundled dylib's minimum target to 15.0 and
-          # makes the resulting wheel installable only on macOS 15+. macos-14
-          # bottles target macOS 14.0, giving the wheel ~2.5 years of OS
-          # compatibility (Sonoma, Sequoia, ...). The deployment target
-          # below has to match so delocate accepts the bundle.
-          - runner: macos-14
+          # macos-15 (Apple Silicon). macos-14 runner images are retired
+          # (brownouts from Oct 2026, removal Nov 2 2026). Homebrew bottles
+          # here target macOS 15.0, so every bundled dylib -- and therefore
+          # the wheel -- needs macOS 15+. The deployment target below has to
+          # match so delocate accepts the bundle.
+          - runner: macos-15
             arch: arm64
-            cibw_build: "cp310-macosx_arm64 cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64"
+            cibw_build: "cp310-macosx_arm64 cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64 cp314-macosx_arm64"
             brew_prefix: /opt/homebrew
-            macosx_deployment_target: '14.0'
+            macosx_deployment_target: '15.0'
 
     steps:
     - name: Checkout repository
@@ -265,20 +391,47 @@ jobs:
         # cppzmq is the C++ header wrapper for zeromq; cereal and cppzmq
         # are header-only. msgpack-c is the C library (the recipe uses
         # the C API in serialize/msgpack_wrapper.h).
-        brew update
-        brew install cmake pkg-config \
-          yaml-cpp cereal msgpack-c libsodium zeromq cppzmq
+        bash CI/retry.sh brew update
+        bash CI/retry.sh brew install cmake pkg-config \
+          yaml-cpp cereal msgpack-c libsodium zeromq cppzmq openssl@3
+
+    # Poco for the runtime's web dashboard, built here for the wheel's
+    # deployment target rather than taken from Homebrew, so its minimum
+    # macOS always matches what delocate accepts. Absolute install names let delocate find and
+    # bundle the dylibs (only PocoNet + PocoFoundation are linked; the
+    # NetSSL/Crypto libraries just satisfy find_package).
+    - name: Build Poco for the wheel's macOS target
+      env:
+        MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
+      run: |
+        POCO_PREFIX="${{ runner.temp }}/poco"
+        bash CI/retry.sh curl -fsSL -o poco.tar.gz \
+          https://github.com/pocoproject/poco/archive/refs/tags/poco-1.14.1-release.tar.gz
+        tar xzf poco.tar.gz
+        cmake -S poco-poco-1.14.1-release -B poco-build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="$POCO_PREFIX" \
+          -DCMAKE_INSTALL_NAME_DIR="$POCO_PREFIX/lib" \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ matrix.macosx_deployment_target }} \
+          -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
+          -DPOCO_MINIMAL_BUILD=ON \
+          -DENABLE_NET=ON -DENABLE_JSON=ON -DENABLE_XML=ON -DENABLE_UTIL=ON \
+          -DENABLE_CRYPTO=ON -DENABLE_NETSSL=ON \
+          -DENABLE_TESTS=OFF -DENABLE_SAMPLES=OFF
+        cmake --build poco-build -j "$(sysctl -n hw.ncpu)"
+        cmake --install poco-build
+        rm -rf poco.tar.gz poco-poco-1.14.1-release poco-build
 
     - name: Install cibuildwheel
-      run: pip install cibuildwheel
+      run: bash CI/retry.sh pip install cibuildwheel
 
     - name: Build macOS wheels
       env:
         CIBW_BUILD: ${{ matrix.cibw_build }}
         # MACOSX_DEPLOYMENT_TARGET must match (or exceed) the minimum
         # macOS target of every dylib bundled by delocate. Homebrew
-        # bottles on the macos-14 runner are built for macOS 14.0, so
-        # the wheel's deployment target has to be at least 14.0 — set
+        # bottles on the macos-15 runner are built for macOS 15.0, so
+        # the wheel's deployment target has to be at least 15.0 — set
         # it for cibuildwheel (which propagates it into the build) AND
         # set it as an env var seen by the C++ compiler.
         MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macosx_deployment_target }}
@@ -290,7 +443,7 @@ jobs:
         # that delocate can resolve against @loader_path/../lib and
         # bundle into the wheel.
         CIBW_ENVIRONMENT_MACOS: >-
-          CMAKE_PREFIX_PATH=${{ matrix.brew_prefix }}
+          CMAKE_PREFIX_PATH="${{ runner.temp }}/poco:${{ matrix.brew_prefix }}"
           PKG_CONFIG_PATH=${{ matrix.brew_prefix }}/lib/pkgconfig
           MACOSX_DEPLOYMENT_TARGET=${{ matrix.macosx_deployment_target }}
           SKBUILD_CMAKE_DEFINE='CLIO_CORE_ENABLE_RPATH=ON'
@@ -348,6 +501,12 @@ jobs:
             arch: x86_64
             distro: fedora:40
             pkg_manager: dnf
+          # Fedora 43 ships Python 3.14 as its python3: the cp314 wheel's
+          # install-and-import leg.
+          - runner: ubuntu-latest
+            arch: x86_64
+            distro: fedora:43
+            pkg_manager: dnf
           # aarch64 tests
           # The aarch64 wheel is a separately built and separately tagged
           # artifact, so it needs its own glibc-2.28 regression test (#973).
@@ -368,7 +527,12 @@ jobs:
     - name: Checkout repository (for test script)
       uses: actions/checkout@v4
       with:
-        sparse-checkout: installers/pip
+        # CI/ as well as installers/pip: the image pull below goes through
+        # CI/retry.sh, which has to exist in the workspace.
+        sparse-checkout: |
+          installers/pip
+          CI
+          context-transfer-engine/wrapper/python
 
     - name: Download wheels
       uses: actions/download-artifact@v4
@@ -376,30 +540,65 @@ jobs:
         name: wheels-${{ matrix.arch }}
         path: wheels/
 
+    # Pull with retry BEFORE the run. A registry hiccup makes `docker run`
+    # exit 125 -- "Error response from daemon: Get
+    # https://registry-1.docker.io/v2/..." -- which reads as a wheel failure
+    # but is Docker Hub being briefly unreachable. Pulling separately keeps the
+    # retry on the network step and off the test itself.
+    - name: Pull ${{ matrix.distro }}
+      run: bash CI/retry.sh docker pull ${{ matrix.distro }}
+
     - name: Test wheel in ${{ matrix.distro }}
       run: |
+        mkdir -p build/capacity-results
         docker run --rm \
           -v "$PWD/wheels:/wheels:ro" \
+          -v "$PWD/context-transfer-engine/wrapper/python:/capacity-tests:ro" \
+          -v "$PWD/build/capacity-results:/capacity-results" \
+          -v "$PWD/installers/pip:/ci:ro" \
+          -v "$PWD/context-transfer-engine/wrapper/python:/capacity-tests:ro" \
+          -v "$PWD/build/capacity-results:/capacity-results" \
           ${{ matrix.distro }} \
           bash -c '
             set -e
 
             # Install Python
             if command -v apt-get &>/dev/null; then
-              apt-get update -qq
-              apt-get install -y -qq python3 python3-pip python3-venv >/dev/null 2>&1
+              for i in 1 2 3; do apt-get update -qq && break || sleep 5; done
+              for i in 1 2 3; do apt-get install -y -qq python3 python3-pip python3-venv >/dev/null 2>&1 && break || sleep 5; done
             elif command -v dnf &>/dev/null; then
               # RHEL8 family (rockylinux:8, #973): the stock python3 is 3.6,
               # older than the oldest wheel we build (cp310). Pull the 3.12
               # AppStream module and put it ahead of the stock interpreter so
               # the venv below matches a wheel we actually ship. Newer distros
               # fall through to their default python3.
-              if dnf install -y -q python3.12 python3.12-pip >/dev/null 2>&1; then
+              #
+              # The expat package is not a typo and not optional. The
+              # rockylinux:8 base image ships expat 2.2.5, but the current
+              # python3.12-3.12.14-1.el8_10
+              # (built 2026-08-24) links pyexpat against 2.4+ symbols, so
+              # importing pyexpat dies with:
+              #   undefined symbol: XML_SetBillionLaughsAttackProtection...
+              # pip imports it, so ensurepip fails and python3 -m venv
+              # aborts -- which is how this arrived, as every test-wheels leg
+              # going red overnight with no change on our side. Naming expat
+              # explicitly upgrades it to 2.5.0 alongside the interpreter.
+              #
+              # NOTE: this whole block is the body of a bash -c single-quoted
+              # string, so no apostrophe may appear anywhere in it, comments
+              # included -- one would close the string and truncate the script
+              # for every distro in the matrix, not just this branch.
+              if dnf install -y -q python3.12 python3.12-pip expat >/dev/null 2>&1; then
                 ln -sf /usr/bin/python3.12 /usr/local/bin/python3
               else
-                dnf install -y -q python3 python3-pip >/dev/null 2>&1
+                dnf install -y -q python3 python3-pip expat >/dev/null 2>&1
               fi
             fi
+
+            # Fail loudly here rather than 20 lines down. Both branches above
+            # swallow their output, so a broken interpreter used to surface as
+            # an opaque ensurepip traceback from the venv step.
+            python3 -c "import pyexpat, ssl, sys; print(\"interpreter OK:\", sys.version)"
 
             # Create clean venv
             python3 -m venv /tmp/test-venv
@@ -409,14 +608,15 @@ jobs:
             # A by-name install (iowarp-core) lets pip consider PyPI, where the
             # same version may already be published with older metadata, and
             # use that PyPI metadata instead of this wheel — so a changed
-            # dependency set (e.g. flask promoted to a core dep) would not be
+            # dependency set would not be
             # exercised. Selecting the wheel file for this Python tag forces
-            # the local artifact; runtime deps (flask, pyyaml, ...) still
+            # the local artifact; runtime deps (pyyaml, msgpack, ...) still
             # resolve from PyPI via --find-links + the default index.
             PYTAG=cp$(python -c "import sys; print(str(sys.version_info[0]) + str(sys.version_info[1]))")
             WHEEL=$(ls /wheels/iowarp_core-*-${PYTAG}-*.whl | head -1)
             echo "Installing built wheel: $WHEEL"
             pip install --quiet --find-links /wheels --no-cache-dir "$WHEEL"
+            pip install --quiet --no-cache-dir psutil
 
             echo "=== Import test ==="
             python -c "import iowarp_core; print(\"Version:\", iowarp_core.get_version())"
@@ -425,12 +625,6 @@ jobs:
 
             echo "=== CLI test ==="
             clio_run --help
-
-            echo "=== Context visualizer (standard feature) ==="
-            # flask is a core dependency, so the dashboard works out of the
-            # box. Verify the package imports and the console script runs.
-            python -c "import context_visualizer; print(\"visualizer import OK\")"
-            context-visualizer --help
 
             echo "=== Benchmark binaries: --help smoke test ==="
             # NOTE: This entire docker invocation is wrapped in bash -c
@@ -466,7 +660,7 @@ jobs:
             # fuse3 runtime like an end user would, then apply the same
             # signal-level heuristic as the benchmarks above.
             if command -v apt-get &>/dev/null; then
-              apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1
+              for i in 1 2 3; do apt-get install -y -qq fuse3 libfuse3-3 >/dev/null 2>&1 && break || sleep 5; done
             elif command -v dnf &>/dev/null; then
               dnf install -y -q fuse3 fuse3-libs >/dev/null 2>&1
             fi
@@ -490,14 +684,36 @@ jobs:
             fi
             unset rc
 
+            echo "=== Web dashboard compiled in and its pages shipped ==="
+            python /ci/check_wheel_dashboard.py
+
             echo "=== Symbol resolution check ==="
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
             export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-            echo "=== Cache + replication chimods present ==="
-            # Both chimods ship by default (#886/#899); a missing lib means
-            # the pip_package component lost them.
-            for mod in cache replication; do
+            echo "=== Every chimod the default config composes is present ==="
+            # The runtime refuses to start when a composed module is missing,
+            # so a module that the shipped clio_default.yaml composes but the
+            # pip_package component omits breaks clio_run start (#1240). Derive
+            # the list from the shipped config so a new module cannot slip by.
+            DATA_DIR=$(python -c "import iowarp_core, os; print(os.path.join(os.path.dirname(iowarp_core.__file__), \"data\"))")
+            MODS=$(sed -n "s/^  - mod_name: *\([A-Za-z0-9_]*\).*/\1/p" "$DATA_DIR/clio_default.yaml")
+            if [ -z "$MODS" ]; then
+              echo "FAIL: no mod_name entries found in $DATA_DIR/clio_default.yaml"
+              exit 1
+            fi
+            for mod in $MODS; do
+              if [ ! -f "$LIB_DIR/lib${mod}_runtime.so" ]; then
+                echo "FAIL: default config composes $mod but lib${mod}_runtime.so is missing from the wheel"
+                exit 1
+              fi
+              echo "  $mod: ok"
+            done
+
+            echo "=== Cache, replication, stream, filesystem chimods present ==="
+            # They ship by default (#886/#899; filesystem needs stream); a
+            # missing lib means the pip_package component lost them.
+            for mod in cache replication stream filesystem; do
               if ! ls "$LIB_DIR"/libclio_cte_${mod}_* >/dev/null 2>&1; then
                 echo "FAIL: libclio_cte_${mod}_* missing from wheel lib dir"
                 exit 1
@@ -525,8 +741,21 @@ jobs:
               ldd "$so" 2>/dev/null | grep -v "linux-vdso\|ld-linux\|libc.so\|libm.so\|libstdc++\|libgcc_s\|libpthread\|librt\|libdl" || true
             done
 
+            MODULE_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_ext_dir())")
+            python /capacity-tests/test_cte_capacity.py \
+              --module-dir "$MODULE_DIR" --bin-dir "$BIN_DIR" \
+              --output-dir /capacity-results
+
             echo "=== All tests passed ==="
           '
+
+    - name: Preserve capacity regression evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: capacity-linux-${{ matrix.arch }}-${{ strategy.job-index }}
+        path: build/capacity-results/
+        if-no-files-found: warn
 
   #------------------------------------------------------------
   # Test macOS wheels natively (Docker is unavailable on GHA macOS).
@@ -545,14 +774,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Same runner as the build so the wheel's macosx_14_0_arm64
+          # Same runner as the build so the wheel's macosx_15_0_arm64
           # platform tag is satisfied (the wheel is also installable on
-          # macos-15+, but pinning here keeps test infra deterministic).
-          - runner: macos-14
+          # later macOS, but pinning here keeps test infra deterministic).
+          - runner: macos-15
             arch: arm64
             python: '3.12'
+          - runner: macos-15
+            arch: arm64
+            python: '3.14'
 
     steps:
+    - name: Check out wheel checks and capacity regression
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          installers/pip
+          context-transfer-engine/wrapper/python
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -576,6 +815,7 @@ jobs:
         WHEEL=$(ls wheels/iowarp_core-*-${PYTAG}-*.whl | head -1)
         echo "Installing built wheel: $WHEEL"
         pip install --quiet --find-links wheels --no-cache-dir "$WHEEL"
+        pip install --quiet --no-cache-dir psutil
 
         echo "=== Import test ==="
         python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
@@ -584,11 +824,6 @@ jobs:
 
         echo "=== CLI test ==="
         clio_run --help
-
-        echo "=== Context visualizer (standard feature) ==="
-        # flask is a core dependency, so the dashboard works out of the box.
-        python -c "import context_visualizer; print('visualizer import OK')"
-        context-visualizer --help
 
         echo "=== Benchmark binaries: --help smoke test ==="
         # Catch SIGSEGV / abort at load time. Bench --help exit codes
@@ -603,6 +838,9 @@ jobs:
           fi
           unset rc
         done
+
+        echo "=== Web dashboard compiled in and its pages shipped ==="
+        python installers/pip/check_wheel_dashboard.py
 
         echo "=== Symbol resolution check (otool -L) ==="
         LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
@@ -621,7 +859,21 @@ jobs:
         fi
         echo "All bundled dylibs are well-formed"
 
+        MODULE_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_ext_dir())")
+        BIN_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_bin_dir())")
+        python context-transfer-engine/wrapper/python/test_cte_capacity.py \
+          --module-dir "$MODULE_DIR" --bin-dir "$BIN_DIR" \
+          --output-dir build/capacity-results
+
         echo "=== All tests passed ==="
+
+    - name: Preserve capacity regression evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: capacity-macos-${{ matrix.arch }}-${{ matrix.python }}
+        path: build/capacity-results/
+        if-no-files-found: warn
 
   #------------------------------------------------------------
   # Test Windows wheels natively (Linux Docker doesn't run on Windows
@@ -634,27 +886,51 @@ jobs:
   #------------------------------------------------------------
   test-wheels-windows:
     needs: build-wheels-windows
-    name: Test Windows wheels
+    name: Test Windows wheels (Python ${{ matrix.python }})
     runs-on: windows-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest-maintained ABI we ship and the newest.
+        include:
+          - python: '3.12'
+            abi: cp312
+          - python: '3.14'
+            abi: cp314
 
     steps:
+    # FIRST step on purpose: actions/checkout cleans the workspace, so running
+    # it after download-artifact deletes the very artifact this job tests
+    # ("Cannot find path ...\\wheels because it does not exist"). Sparse
+    # because the job needs only the retry helper, not the tree -- without a
+    # checkout at all the helper is absent and the step dies with "The argument
+    # 'CI/Retry.ps1' is not recognized as the name of a script file".
+    - name: Check out CI helpers and capacity regression
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          CI
+          context-transfer-engine/wrapper/python
+          installers/pip
+          context-transfer-engine/wrapper/python
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.12'
+        python-version: ${{ matrix.python }}
 
     - name: Download Windows wheels
       uses: actions/download-artifact@v4
       with:
-        name: wheels-win_amd64
+        name: wheels-win_amd64-${{ matrix.abi }}
         path: wheels/
 
     # WinFsp runtime for the fuse adapter smoke test (#899) — end users
     # install this from winfsp.dev. The DLL lives under
     # %ProgramFiles(x86)%\WinFsp\bin, which is not on PATH by default.
     - name: Install WinFsp (FUSE adapter runtime)
-      run: choco install winfsp -y --no-progress
+      run: pwsh CI/Retry.ps1 choco install winfsp -y --no-progress
 
     - name: Test wheel in clean venv
       shell: pwsh
@@ -669,6 +945,8 @@ jobs:
         Write-Host "Installing built wheel: $wheel"
         pip install --quiet --find-links wheels --no-cache-dir $wheel
         if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+        pip install --quiet --no-cache-dir psutil
+        if ($LASTEXITCODE -ne 0) { throw "capacity test dependency install failed" }
 
         Write-Host "=== Import test ==="
         python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
@@ -687,15 +965,6 @@ jobs:
         # crash; positive small codes are app-level "I printed usage".
         if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
           throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL or binary)"
-        }
-
-        Write-Host "=== Context visualizer (standard feature) ==="
-        # flask is a core dependency, so the dashboard works out of the box.
-        python -c "import context_visualizer; print('visualizer import OK')"
-        if ($LASTEXITCODE -ne 0) { throw "context_visualizer import failed" }
-        context-visualizer --help
-        if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
-          throw "context-visualizer --help died with exit code $LASTEXITCODE"
         }
 
         Write-Host "=== Benchmark binaries: --help smoke test ==="
@@ -727,6 +996,17 @@ jobs:
         python -c "import iowarp_core, glob, os, sys; dirs = [iowarp_core.get_lib_dir(), iowarp_core.get_bin_dir()]; missing = [m for m in ('cache', 'replication') if not any(glob.glob(os.path.join(d, f'*clio_cte_{m}_*')) for d in dirs)]; sys.exit(f'missing chimods: {missing}' if missing else 0)"
         if ($LASTEXITCODE -ne 0) { throw "cache/replication chimod DLLs missing from wheel" }
 
+        Write-Host "=== Web dashboard compiled in and its pages shipped ==="
+        python installers/pip/check_wheel_dashboard.py
+        if ($LASTEXITCODE -ne 0) { throw "wheel has no web dashboard" }
+
+        $moduleDir = python -c "import iowarp_core; print(iowarp_core.get_ext_dir())"
+        if ($LASTEXITCODE -ne 0) { throw "get_ext_dir failed" }
+        python context-transfer-engine/wrapper/python/test_cte_capacity.py `
+          --module-dir "$moduleDir" --bin-dir "$binDir" `
+          --output-dir build/capacity-results
+        if ($LASTEXITCODE -ne 0) { throw "capacity binding regression failed" }
+
         Write-Host "=== All Windows tests passed ==="
         # The bench --help calls above leave $LASTEXITCODE = 1 (they print
         # usage and exit non-zero, which we treat as success here). pwsh
@@ -734,6 +1014,14 @@ jobs:
         # which makes GitHub Actions mark the step as failed even though
         # every check above passed. Force success explicitly.
         exit 0
+
+    - name: Preserve capacity regression evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: capacity-windows-${{ matrix.python }}
+        path: build/capacity-results/
+        if-no-files-found: warn
 
   #------------------------------------------------------------
   # Publish to PyPI on version tags
@@ -749,6 +1037,7 @@ jobs:
       - test-wheels-macos
       - test-wheels-windows
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: startsWith(github.ref, 'refs/tags/v')
     environment:
       name: pypi
@@ -772,7 +1061,8 @@ jobs:
     - name: Download Windows wheels
       uses: actions/download-artifact@v4
       with:
-        name: wheels-win_amd64
+        pattern: wheels-win_amd64-*
+        merge-multiple: true
         path: dist/
 
     - name: Download macOS arm64 wheels
@@ -791,6 +1081,54 @@ jobs:
         verbose: true
 
   #------------------------------------------------------------
+  # Publish GPU variants. Separate from publish-to-pypi so a GPU build
+  # failure cannot block the CPU release. Each distribution
+  # (iowarp-core-cuda12/-rocm6/-sycl) needs its own trusted-publisher entry
+  # on PyPI before this can succeed.
+  #------------------------------------------------------------
+  publish-gpu-to-pypi:
+    name: Publish GPU wheels to PyPI
+    needs: [check-version, build-wheels-gpu]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+    permissions:
+      id-token: write
+    steps:
+    - name: Download GPU wheels
+      uses: actions/download-artifact@v4
+      with:
+        pattern: wheels-gpu-*
+        merge-multiple: true
+        path: dist/
+
+    - name: List distributions
+      run: ls -lh dist/
+
+    # Trusted publishing first. A project that does not exist on PyPI yet
+    # can only be created by trusted publishing if an owner registered a
+    # "pending publisher" for it; until then fall back to the API token,
+    # which can create the project if it is account-scoped. The `id` lets the
+    # fallback run only when this step failed.
+    - name: Publish to PyPI (trusted publishing)
+      id: trusted
+      continue-on-error: true
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        skip-existing: true
+        verbose: true
+
+    - name: Publish to PyPI (API token fallback)
+      if: steps.trusted.outcome == 'failure'
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        password: ${{ secrets.PYPI_API_TOKEN }}
+        skip-existing: true
+        verbose: true
+
+  #------------------------------------------------------------
   # Create GitHub Release on version tags
   #------------------------------------------------------------
   github-release:
@@ -804,6 +1142,7 @@ jobs:
       - test-wheels-macos
       - test-wheels-windows
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -824,7 +1163,8 @@ jobs:
     - name: Download Windows wheels
       uses: actions/download-artifact@v4
       with:
-        name: wheels-win_amd64
+        pattern: wheels-win_amd64-*
+        merge-multiple: true
         path: dist/
 
     - name: Download macOS arm64 wheels

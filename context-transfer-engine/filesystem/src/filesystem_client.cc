@@ -5,7 +5,9 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/filesystem/filesystem_client.h>
+#include <clio_cte/stream/stream_client.h>
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -69,7 +71,6 @@ bool CLIO_CFS_CLIENT_INIT(const std::string &config_path,
   return true;
 }
 
-#if !defined(_WIN32)
 // Descriptor layer -- POSIX only, see filesystem_client.h.
 
 /**
@@ -91,6 +92,17 @@ bool Client::EnsureInit() {
   return ready;
 }
 
+void Client::MakeParents(const std::string &path) {
+  // Every ancestor, outermost first; EEXIST (or a race with another creator)
+  // is fine -- the create that follows reports any real failure.
+  size_t pos = 1;
+  while ((pos = path.find('/', pos)) != std::string::npos) {
+    auto m = AsyncMkdir(path.substr(0, pos));
+    m.Wait();
+    ++pos;
+  }
+}
+
 int Client::OpenFd(const std::string &raw_path, int flags, int mode) {
   if (!EnsureInit()) {
     errno = EIO;
@@ -100,8 +112,18 @@ int Client::OpenFd(const std::string &raw_path, int flags, int mode) {
   auto t = AsyncOpen(path, static_cast<clio::run::u32>(flags),
                           static_cast<clio::run::u32>(mode));
   t.Wait();
-  if (t->GetReturnCode() != 0) {
-    errno = EIO;
+  if ((flags & O_CREAT) != 0 && t->GetReturnCode() == ENOENT) {
+    // A `clio::` path mirrors a host path whose directories exist on the host
+    // but not (yet) in clio-fs: create the missing parents, then retry once.
+    // (FUSE stays strictly POSIX: a create under a missing parent is ENOENT.)
+    MakeParents(path);
+    t = AsyncOpen(path, static_cast<clio::run::u32>(flags),
+                  static_cast<clio::run::u32>(mode));
+    t.Wait();
+  }
+  const clio::run::u32 rc = t->GetReturnCode();
+  if (rc != 0) {
+    errno = rc < 4096 ? static_cast<int>(rc) : EIO;
     return -1;
   }
   if (t->handle_ == 0) {
@@ -127,24 +149,24 @@ int Client::OpenFd(const std::string &raw_path, int flags, int mode) {
   return fd;
 }
 
-ssize_t Client::ReadFd(int fd, void *buf, size_t count) {
+FsSsize Client::ReadFd(int fd, void *buf, size_t count) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
   }
-  ssize_t n = Read(of.handle, of.path, of.off, buf, count);
+  FsSsize n = Read(of.handle, of.path, of.off, buf, count);
   if (n > 0) {
     AdvanceFd(fd, static_cast<clio::run::u64>(n));
   }
   return n;
 }
 
-ssize_t Client::WriteFd(int fd, const void *buf, size_t count) {
+FsSsize Client::WriteFd(int fd, const void *buf, size_t count) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
   }
-  ssize_t n = Write(of.handle, of.path, of.off, buf, count,
+  FsSsize n = Write(of.handle, of.path, of.off, buf, count,
                                      IsSyncFd(of.flags));
   if (n > 0) {
     AdvanceFd(fd, static_cast<clio::run::u64>(n));
@@ -152,7 +174,7 @@ ssize_t Client::WriteFd(int fd, const void *buf, size_t count) {
   return n;
 }
 
-ssize_t Client::PreadFd(int fd, void *buf, size_t count, off_t offset) {
+FsSsize Client::PreadFd(int fd, void *buf, size_t count, FsOff offset) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
@@ -161,7 +183,7 @@ ssize_t Client::PreadFd(int fd, void *buf, size_t count, off_t offset) {
                                static_cast<clio::run::u64>(offset), buf, count);
 }
 
-ssize_t Client::PwriteFd(int fd, const void *buf, size_t count, off_t offset) {
+FsSsize Client::PwriteFd(int fd, const void *buf, size_t count, FsOff offset) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
@@ -171,7 +193,7 @@ ssize_t Client::PwriteFd(int fd, const void *buf, size_t count, off_t offset) {
                                 IsSyncFd(of.flags));
 }
 
-off_t Client::SeekFd(int fd, off_t offset, int whence) {
+FsOff Client::SeekFd(int fd, FsOff offset, int whence) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
@@ -199,7 +221,7 @@ off_t Client::SeekFd(int fd, off_t offset, int whence) {
       errno = EINVAL;
       return -1;
   }
-  off_t newoff = static_cast<off_t>(base) + offset;
+  FsOff newoff = static_cast<FsOff>(base) + offset;
   if (newoff < 0) {
     errno = EINVAL;
     return -1;
@@ -214,15 +236,15 @@ off_t Client::SeekFd(int fd, off_t offset, int whence) {
   return newoff;
 }
 
-off_t Client::TellFd(int fd) {
+FsOff Client::TellFd(int fd) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
   }
-  return static_cast<off_t>(of.off);
+  return static_cast<FsOff>(of.off);
 }
 
-off_t Client::SizeFd(int fd) {
+FsOff Client::SizeFd(int fd) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
@@ -231,7 +253,7 @@ off_t Client::SizeFd(int fd) {
   if (!GetSize(of.path, &size)) {
     return -1;
   }
-  return static_cast<off_t>(size);
+  return static_cast<FsOff>(size);
 }
 
 int Client::SyncFd(int fd) {
@@ -242,10 +264,128 @@ int Client::SyncFd(int fd) {
   // Wait for every deferred write on this file and report a latched failure
   // exactly once — fsync and close are the only two places a deferred write's
   // failure can reach the application.
-  return Flush(of.path);
+  if (Flush(of.path) != 0) {
+    return -1;
+  }
+  // Then put the bytes on a persistent device. Draining alone left them on
+  // whatever tier took them (RAM) until the periodic flush, while the same
+  // file fsynced through the FUSE mount was durable (#1188).
+  int rc = SyncDurable(TagOfPath(of.path, /*want_dir=*/false),
+                       FsParentDir(of.path));
+  if (rc != 0) {
+    errno = -rc;
+    return -1;
+  }
+  return 0;
 }
 
-int Client::FtruncateFd(int fd, off_t length) {
+namespace {
+/** CTE performance.fsync_mode from the first SyncTag reply: -1 not yet
+ *  known, 0 "durable", 1 "deferred". */
+std::atomic<int> g_fsync_deferred{-1};
+}  // namespace
+
+bool Client::FsyncDeferred() {
+  return g_fsync_deferred.load(std::memory_order_relaxed) == 1;
+}
+
+int Client::SyncTagDurable(const clio::cte::core::TagId &tag, bool *lost_node,
+                           clio::run::u64 *liveness_change_ns) {
+  if (lost_node != nullptr) *lost_node = false;
+  if (liveness_change_ns != nullptr) *liveness_change_ns = 0;
+  if (FsyncDeferred()) return 0;
+  auto *cte_c = CLIO_CTE_CLIENT;
+  if (cte_c == nullptr || tag.IsNull()) return 0;
+  auto fut = cte_c->AsyncSyncTag(tag);
+  fut.Wait();
+  const bool deferred = fut->deferred_ != 0;
+  g_fsync_deferred.store(deferred ? 1 : 0, std::memory_order_relaxed);
+  if (deferred) return 0;
+  if (fut->containers_ == 0) {
+    // A module in front of the core dropped the sync: nothing was made
+    // durable, so fsync must not claim it was.
+    static std::once_flag warned;
+    std::call_once(warned, [&] {
+      HLOG(kError, "fsync reached no CTE core container through pool {}.{}; "
+           "fsync fails with EIO", cte_c->pool_id_.major_,
+           cte_c->pool_id_.minor_);
+    });
+    return -EIO;
+  }
+  const clio::run::u32 rc = fut->GetReturnCode();
+  if (rc == clio::cte::core::kSyncNoSpaceRc) return -ENOSPC;
+  if (rc != 0 && !clio::cte::core::IsNodeLostRc(rc)) {
+    HLOG(kError, "fsync of tag {}.{} failed (rc {}); reporting EIO",
+         tag.major_, tag.minor_,
+         static_cast<long long>(static_cast<clio::run::i32>(rc)));
+    return -EIO;
+  }
+  // rc != 0 here is the lost-node code: the live containers synced.
+  if (lost_node != nullptr) *lost_node = rc != 0;
+  if (liveness_change_ns != nullptr) {
+    *liveness_change_ns = fut->liveness_change_ns_;
+  }
+  return 0;
+}
+
+int Client::SyncFileSize(const clio::cte::core::TagId &tag) {
+  if (tag.IsNull()) return 0;
+  const clio::run::u64 packed = FsPack(tag);
+  if (!FsIdHasHome(packed)) return 0;
+  clio::cte::stream::Client stream;
+  auto f = stream.AsyncSizeOp(tag, FsIdHome(packed),
+                              clio::cte::stream::StreamSizeOp::kSync);
+  f.Wait();
+  const clio::run::u32 rc = f->GetReturnCode();
+  if (rc == 0) return 0;
+  if (clio::cte::core::IsNodeLostRc(rc)) {
+    // The home died: a size it logged is in its log (replayed when it
+    // restarts); sizes set since then are logged by its successor.
+    HLOG(kWarning, "fsync of the size of {}.{}: its home is down",
+         tag.major_, tag.minor_);
+    return 0;
+  }
+  HLOG(kError, "fsync of the size of {}.{} failed (rc {})", tag.major_,
+       tag.minor_, rc);
+  return -EIO;
+}
+
+clio::cte::core::TagId Client::TagOfPath(const std::string &path,
+                                         bool want_dir) {
+  auto t = AsyncGetattr(path);
+  t.Wait();
+  if (t->GetReturnCode() != 0 || t->exists_ == 0 ||
+      (want_dir && t->is_dir_ == 0)) {
+    return clio::cte::core::TagId::GetNull();
+  }
+  return FsUnpack(t->ino_);
+}
+
+int Client::SyncDurable(const clio::cte::core::TagId &tag,
+                        const std::string &dir) {
+  int rc = SyncTagDurable(tag);
+  if (rc != 0) return rc;
+  if (FsyncDeferred()) return 0;
+  rc = SyncFileSize(tag);
+  if (rc != 0) return rc;
+  rc = SyncTagDurable(TagOfPath(dir, /*want_dir=*/true));
+  if (rc != 0) return rc;
+  return SyncMetaDurable();
+}
+
+int Client::SyncMetaDurable() {
+  if (FsyncDeferred()) return 0;
+  auto t = AsyncSyncMeta();
+  t.Wait();
+  const clio::run::u32 rc = t->GetReturnCode();
+  if (rc != 0 && !clio::cte::core::IsNodeLostRc(rc)) {
+    HLOG(kError, "fsync of the filesystem namespace failed (rc {})", rc);
+    return -EIO;
+  }
+  return 0;
+}
+
+int Client::FtruncateFd(int fd, FsOff length) {
   OpenFile of;
   if (!LookupFd(fd, &of)) {
     return -1;
@@ -253,7 +393,7 @@ int Client::FtruncateFd(int fd, off_t length) {
   return TruncatePath(std::string(kClioPrefix) + of.path, length);
 }
 
-int Client::TruncatePath(const std::string &raw_path, off_t length) {
+int Client::TruncatePath(const std::string &raw_path, FsOff length) {
   if (!EnsureInit()) {
     errno = EIO;
     return -1;
@@ -319,7 +459,10 @@ int Client::ReaddirPath(const std::string &raw_path, std::vector<std::string> *o
   auto t = AsyncReaddir(path);
   t.Wait();
   if (t->GetReturnCode() != 0) {
-    errno = ENOENT;
+    // Pass the server's errno through: a listing that failed (EAGAIN, EIO)
+    // is not a missing directory (#1029).
+    const clio::run::u32 rc = t->GetReturnCode();
+    errno = rc < 4096 ? static_cast<int>(rc) : EIO;  // runtime codes -> EIO
     return -1;
   }
   out->clear();
@@ -358,6 +501,5 @@ int Client::CloseFd(int fd) {
   return (t->GetReturnCode() == 0) ? 0 : -1;
 }
 
-#endif  // !_WIN32
 
 }  // namespace clio::cte::filesystem

@@ -1,5 +1,15 @@
 #!/bin/bash
 set -e
+# Remove this user's clio shared-memory files only. A bare
+# `rm -f /dev/shm/clio_*` under set -e aborted the test on nodes where
+# another user's job left a clio_* DIRECTORY there.
+clean_shm() {
+  local p
+  for p in /dev/shm/clio_*; do
+    [ -f "$p" ] && [ -O "$p" ] && rm -f "$p"
+  done
+  return 0
+}
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Use BIN_DIR from environment, or fall back to /workspace/build/bin
@@ -11,16 +21,28 @@ echo "=== CTE Restart Integration Test ==="
 echo "BIN_DIR: $BIN_DIR"
 echo "COMPOSE_CONFIG: $COMPOSE_CONFIG"
 
-# Stop runtime helper: try clio_run runtime stop, fall back to kill
+# Stop the runtime and WAIT FOR IT TO ACTUALLY EXIT.
+#
+# Same fix as the replication_persist driver: a flat `sleep 2` then SIGKILL
+# cuts the runtime off 3s BEFORE its own 5000 ms graceful-teardown budget, and
+# teardown is where persisted state is flushed. This test has not been failing,
+# but it restarts the runtime and reads back what survived -- exactly the shape
+# that lost blobs in cte_replication_persist_integration on macOS, where the
+# metadata segment is file-backed (no memfd) and teardown does real disk I/O.
+STOP_TIMEOUT_S=${STOP_TIMEOUT_S:-30}
 stop_runtime() {
     if [ -n "$RUNTIME_PID" ] && kill -0 $RUNTIME_PID 2>/dev/null; then
         $BIN_DIR/clio_run runtime stop 2>/dev/null || true
-        # Give graceful shutdown a chance
-        sleep 2
-        # Force kill if still running
-        if kill -0 $RUNTIME_PID 2>/dev/null; then
-            kill -9 $RUNTIME_PID 2>/dev/null || true
-        fi
+        waited=0
+        while kill -0 $RUNTIME_PID 2>/dev/null; do
+            if [ "$waited" -ge "$STOP_TIMEOUT_S" ]; then
+                echo "WARNING: runtime did not exit within ${STOP_TIMEOUT_S}s; sending SIGKILL" >&2
+                kill -9 $RUNTIME_PID 2>/dev/null || true
+                break
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
         wait $RUNTIME_PID 2>/dev/null || true
     fi
     RUNTIME_PID=""
@@ -30,14 +52,14 @@ stop_runtime() {
 cleanup() {
     stop_runtime
     sleep 1
-    rm -f /dev/shm/clio_*
+    clean_shm
     rm -rf "$CONF_DIR"
     rm -rf /tmp/cte_restart_ram
 }
 trap cleanup EXIT
 
 # Clean slate
-rm -f /dev/shm/clio_*
+clean_shm
 rm -rf "$CONF_DIR"
 rm -rf /tmp/cte_restart_ram
 
@@ -46,7 +68,7 @@ echo ""
 echo "=== Phase 1: Start runtime and store blobs ==="
 
 export CLIO_SERVER_CONF="$COMPOSE_CONFIG"
-$BIN_DIR/clio_run runtime start &
+$BIN_DIR/clio_run runtime start --fresh &
 RUNTIME_PID=$!
 sleep 3
 
@@ -61,7 +83,7 @@ stop_runtime
 sleep 1
 
 # Clear SHM but keep persistent files
-rm -f /dev/shm/clio_*
+clean_shm
 
 echo "Phase 1 complete. Persistent files in $CONF_DIR:"
 ls -la "$CONF_DIR"/restart/ 2>/dev/null || echo "  (no restart dir yet)"

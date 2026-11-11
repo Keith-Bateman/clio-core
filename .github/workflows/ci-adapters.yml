@@ -21,12 +21,33 @@ name: CI Adapters
 #             suites; FSKit-backend mount smoke as a non-blocking probe)
 #   Windows : hdf5_vol + libfuse (WinFsp build + unit + in-process ops
 #             suites + live WinFsp mount smoke)
+#
+# NOT A REQUIRED CHECK (2026-08-25, issue #1022). "adapters (linux, all 5)" was
+# a required status check on the dev and main rulesets and was removed from
+# both. Reason: over 157 runs (2026-08-05..08-25) it blocked 5 of 134 otherwise
+# clean runs on xfstests that flake under the runner's scheduling, on branches
+# that touched nothing those tests exercise -- a macFUSE-only build fix, a
+# dashboard-teardown fix, a bdev preallocation clamp. Blocking a merge on a
+# result the author cannot act on trains people to re-run instead of read.
+#
+# It still runs on every PR and every push: this is informational coverage, not
+# a gate. Take it seriously -- the five known-flaky xfstests are quarantined
+# (scripts/xfstests/ci_flaky_quarantine.txt) precisely so that what is left CAN
+# be trusted. Re-add it to the rulesets once it has been green for a stretch on
+# its own merits.
 
 on:
   push:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
+  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
+  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
+  # single bad commit turns every later push red. A merge_group run is that
+  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
+  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -97,7 +118,7 @@ jobs:
       # /usr/local; installing the cask needs no kext approval — only
       # mounting through the kext backend would.
       - name: Install macFUSE (libfuse3 for the adapter build)
-        run: brew install --cask macfuse
+        run: bash CI/retry.sh brew install --cask macfuse
       - name: Configure and build (hdf5_vol + macfuse)
         run: |
           set -x
@@ -156,7 +177,40 @@ jobs:
             --no-binary=h5py h5py numpy
           ctest --test-dir build-adapters --output-on-failure \
             --timeout 180 --repeat until-pass:2 \
-            -R "hdf5_vol|fuse" -E "copy_workspace" -LE "docker|ollama"
+            -R "hdf5_vol|fuse" -E "copy_workspace" -LE "docker|ollama|flaky"
+      # fuse_ops has crashed with a bare `***Exception: SegFault` on every
+      # macOS adapters run since at least 2026-08-21, always inside the
+      # "hard link" case. ctest reports the signal and throws the stack away,
+      # so there has never been anything to diagnose from. Re-run just that
+      # binary under lldb on failure to capture one.
+      #
+      # if: failure() so it costs nothing on a green run, and it cannot change
+      # the gate -- the ctest step above has already decided the job.
+      - name: Backtrace fuse_ops on crash (diagnostic only)
+        if: failure()
+        continue-on-error: true
+        run: |
+          exe=$(find build-adapters -name 'test_fuse_ops*' -type f -perm -u+x | head -1)
+          echo "fuse_ops binary: ${exe:-<not found>}"
+          if [ -z "$exe" ]; then exit 0; fi
+          # First pass produced only frame #0 (lldb could not unwind), so ask
+          # for every thread's stack explicitly and dump the faulting pointer.
+          # MallocScribble/MallocPreScribble make a use-after-free show up as
+          # 0x55.. / 0xaa.. instead of random garbage, which distinguishes
+          # "freed object" from "wrong address computed" -- the two candidates
+          # for a wild mutex pointer.
+          # -o commands after `run` are ABANDONED once the target crashes in
+          # --batch mode, which is why the first two attempts printed only the
+          # stop line. -k / --one-line-on-crash is the hook that actually fires
+          # on the crash.
+          #
+          # Scribble stays on, but note it has already told us something: the
+          # fault address differs every run (0x61de.., 0xb731..) and matches
+          # NEITHER 0x55.. nor 0xaa.., so this is not a freed-heap read. That
+          # points at an uninitialised/wild pointer or memory libmalloc never
+          # owned (e.g. shared-memory backed), not a classic use-after-free.
+          export MallocScribble=1 MallocPreScribble=1
+          lldb --batch                -k 'thread backtrace all'                -k 'register read x0 lr pc sp fp'                -k 'image lookup --address $lr'                -k 'memory read --size 8 --format x --count 4 $sp'                -k quit                -o run                -o quit                -- "$exe" 2>&1 | tail -200
       # Real mount attempt via the FSKit backend (kext-free; macFUSE 5.1+,
       # macOS 15.4+, mountpoint must live under /Volumes). NON-BLOCKING: FSKit
       # extension approval semantics on runner images are unproven — promote
@@ -202,7 +256,21 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: x64-windows
       CAE_LABEL_TEST_SKIP: "1"
     steps:
+      # actions/checkout has no retry, and Windows runners intermittently fail
+      # the fetch with a transient schannel SEC_E_UNTRUSTED_ROOT (#1043). Let
+      # the first attempt fail, pause, and check out once more.
       - name: Checkout repository
+        id: checkout
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Wait before retrying checkout
+        if: steps.checkout.outcome == 'failure'
+        shell: pwsh
+        run: Start-Sleep -Seconds 15
+      - name: Checkout repository (retry)
+        if: steps.checkout.outcome == 'failure'
         uses: actions/checkout@v6
         with:
           submodules: recursive
@@ -213,16 +281,38 @@ jobs:
           $url = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-$ver.msi"
           $msi = "$env:RUNNER_TEMP\winfsp.msi"
           Write-Host "Downloading WinFsp $ver from $url"
-          Invoke-WebRequest -Uri $url -OutFile $msi
+          # The release CDN drops out briefly; retry the download (#1043).
+          for ($i = 1; $i -le 5; $i++) {
+            try { Invoke-WebRequest -Uri $url -OutFile $msi; break }
+            catch {
+              if ($i -eq 5) { throw }
+              Write-Host "WinFsp download attempt $i failed: $_; retrying"
+              Start-Sleep -Seconds (10 * $i)
+            }
+          }
           # ADDLOCAL=ALL pulls in the Developer feature (inc/fuse3 + lib).
           $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn ADDLOCAL=ALL" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "WinFsp install failed ($($p.ExitCode))" }
           Get-ChildItem "C:\Program Files (x86)\WinFsp\inc\fuse3" -ErrorAction SilentlyContinue
       - name: Bootstrap vcpkg
+        shell: pwsh
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
-          git pull
-          .\bootstrap-vcpkg.bat
+          # Same retry as ci-windows.yml: git pull and the vcpkg.exe download
+          # are network calls that intermittently fail on Windows (#1043).
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            git pull
+            .\bootstrap-vcpkg.bat
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            $delay = $i * 15
+            Write-Host "bootstrap-vcpkg attempt $i failed (exit $LASTEXITCODE); retry in ${delay}s"
+            Start-Sleep -Seconds $delay
+          }
+          if (-not $ok) {
+            Write-Error "bootstrap-vcpkg failed after 5 attempts"
+            exit 1
+          }
       - name: Configure CMake (hdf5_vol + WinFsp fuse)
         # VCPKG_APPLOCAL_DEPS=OFF disables vcpkg's per-target post-build
         # "z-applocal" DLL copy into build/bin/ altogether. With HDF5_VOL=ON
@@ -284,11 +374,13 @@ jobs:
           # VCPKG_APPLOCAL_DEPS=OFF above means dependency DLLs were never
           # copied next to the exes -- resolve them from the vcpkg tree.
           $env:PATH = "${{ github.workspace }}\build\vcpkg_installed\x64-windows\debug\bin;${{ github.workspace }}\build\vcpkg_installed\x64-windows\bin;$env:PATH"
-          # fuse_ops is excluded on Windows: it hangs with zero output until
-          # the ctest timeout (at 300s AND 900s ceilings — hung, not slow).
-          # Tracked in #907; test_fuse_adapter + the live mount smoke below
-          # are the Windows FUSE coverage until it is root-caused.
-          ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite|fuse_ops" -LE "docker|ollama"
+          # fuse_ops is excluded on Windows CI (#907): it hangs with zero
+          # output until its 900 s ctest TIMEOUT, every run -- including the
+          # 6 dev pushes after 1abcbf0bd re-enabled it -- while a native
+          # Windows build with WinFsp passes it 8/8 in ~1 s. The hang is
+          # specific to the hosted runner; test_fuse_adapter + the live mount
+          # smoke below are the Windows FUSE coverage until it is root-caused.
+          ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 --repeat until-pass:2 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite|fuse_ops" -LE "docker|ollama|flaky"
       # Live end-to-end WinFsp mount (#903): runtime up -> compose -> mount a
       # drive letter -> write/read/verify -> unmount. The WinFsp MSI install
       # above included the driver, so mounting works without a reboot.

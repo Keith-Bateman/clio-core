@@ -123,7 +123,7 @@ Whenever you build a new function, always create a docstring for it. It should d
 
 ### GPU Compiler Macro Rule
 
-**NEVER** use raw GPU compiler-detection macros (`__CUDACC__`, `__HIPCC__`, `__HIP__`, `__CUDA_ARCH__`, `__HIP_DEVICE_COMPILE__`) anywhere except `context-transport-primitives/include/clio_ctp/constants/macros.h`. We do not want code paths to compile just because a GPU compiler is being used — we need the explicit CMake build flags (`CTP_ENABLE_CUDA`, `CTP_ENABLE_ROCM`) to be set as well.
+**NEVER** use raw GPU compiler-detection macros (`__CUDACC__`, `__HIPCC__`, `__HIP__`, `__CUDA_ARCH__`, `__HIP_DEVICE_COMPILE__`) anywhere except `context-transport-primitives/constants/include/clio_ctp/constants/macros.h`. We do not want code paths to compile just because a GPU compiler is being used — we need the explicit CMake build flags (`CTP_ENABLE_CUDA`, `CTP_ENABLE_ROCM`) to be set as well.
 
 **Use these macros instead:**
 - `CTP_IS_GPU` — true when compiling device code (replaces `__CUDA_ARCH__` / `__HIP_DEVICE_COMPILE__`)
@@ -259,6 +259,104 @@ NEVER DO MOCK CODE OR STUB CODE UNLESS SPECIFICALLY STATED OTHERWISE. ALWAYS IMP
 - Built with MPI, HDF5, and ZeroMQ support
 - SST is disabled due to ARM64 Linux compatibility issues in the DILL library
 
+### Local build hygiene
+
+#### Local tests fail deterministically while CI is green
+
+**Symptom.** The CTE registers no storage targets, so every `PutBlob` returns
+rc=11 (`available_targets` empty) even though the bdev pools compose fine and
+`RegisterTarget` reports success. `GetCapacity` reports 0 indefinitely. Whole
+families go red at once — `cte_evict`, `cte_tiered_storage_all`,
+`cte_reorganize_all`, the HDF5 VOL/VFD suites.
+
+**Cause.** A build directory that has been incrementally rebuilt across many
+commits. A stale tree can fail most of the CTE suite while a tree
+configured fresh at the same commit passes it.
+
+**Fix.** Configure a NEW build directory, alongside the old one. Per the CRITICAL
+BUILD RULE above, do not `rm -rf` the existing one — just make another:
+
+```bash
+cmake -S /workspace -B /workspace/build-fresh \
+      -DBUILD_TESTING=ON -DCLIO_CORE_ENABLE_TESTS=ON
+cmake --build /workspace/build-fresh -j "$(nproc)"
+```
+
+**Do not** restart the container or rebuild the devcontainer image first.
+Neither is the cause, and every built library already agreed on the coroutine
+backend.
+
+#### ...or root-owned leftovers in /tmp
+
+A second, unrelated environmental trap with a different signature. Sessions that
+ran the container as `root` leave test artifacts behind; the container now runs
+as `iowarp`, which cannot open them. Affected tests fail in seconds with a
+permission error rather than a timeout:
+
+```
+ERROR Init Failed to open bdev file: /tmp/clio_vol_io_backend.dat (Permission denied)
+ERROR RegisterTarget Failed to create bdev container /tmp/clio_vol_io_backend.dat : 2
+PermissionError: [Errno 13] Permission denied: '/tmp/hdf5compat/clio_suite.yaml'
+```
+
+This hits the adapter suites hardest — `cte_hdf5_vol_io_*`, the VOL and VFD
+compat suites — because each keeps a fixed backing file or work directory in
+`/tmp`. Fix by taking ownership of the leftovers:
+
+```bash
+sudo chown -R iowarp:iowarp /tmp/hdf5compat /tmp/hdf5vfdcompat
+sudo find /tmp -maxdepth 1 -user root \
+     \( -name 'clio*' -o -name '*.dat' -o -name '*.h5' \) \
+     -exec chown iowarp:iowarp {} +
+```
+
+**Telling the two apart.** They look alike — whole families red while CI is
+green — and can be present at the same time:
+
+| symptom | cause |
+|---|---|
+| `PutBlob` rc=11, `available_targets` empty, `GetCapacity` 0 forever | stale build tree |
+| `RegisterTarget` rc=1, log shows `Permission denied` on a `/tmp` path | root-owned leftovers |
+
+#### Rebuild everything after touching a task struct
+
+Task structs (`PutBlobTask`, `EvictTask`, ...) cross the client/runtime boundary
+through shared memory, so their layout is ABI. Add or reorder a field, build
+only one target, and the other side reads at stale offsets — which surfaces as
+plausible garbage rather than a crash. Adding `EvictTask::droppable_only_` and
+rebuilding only the test binary made `cte_evict` report `bytes_evicted=0
+blobs_evicted=2097152`: the byte budget landing in the wrong field.
+
+After any task-struct change, build with no `--target`:
+
+```bash
+cmake --build /workspace/build-fresh -j "$(nproc)"
+```
+
+#### Adapter tests need their adapter enabled
+
+`CLIO_CORE_ENABLE_HDF5=ON` enables HDF5 **in the CAE only**. The two HDF5
+connectors are separate options, both default OFF:
+
+- `-DCLIO_CTE_ENABLE_HDF5_VOL=ON` — builds `clio_vol.cc` and the
+  `cte_hdf5_vol_*` tests
+- `-DCLIO_CTE_ENABLE_VFD=ON` — builds `H5FDclio.cc` and the VFD suites
+
+Without them, a change to a connector compiles nothing and its tests silently
+do not exist in the tree. Check that the file was actually compiled before
+claiming a build is clean.
+
+For how the connectors fit into HDF5, which to use, and the ways a setup
+silently does nothing, see `context-transfer-engine/adapter/HDF5_QUICKSTART.md`.
+Set `CLIO_REQUIRE_RUNTIME=1` in any measurement, so a run that never reached
+the runtime fails instead of reporting a clean zero.
+
+#### CI green is weaker evidence than it looks
+
+`ci-linux.yml` runs ctest with `--repeat until-pass:3`, and the macOS jobs
+still exclude some tests by name (`-E`). A test can be flaky, or skipped
+outright, and still show green.
+
 ### Component Build Options
 The unified IOWarp Core build system provides options to enable/disable components:
 - `CLIO_CORE_ENABLE_RUNTIME`: Enable runtime component (default: ON)
@@ -268,14 +366,14 @@ The unified IOWarp Core build system provides options to enable/disable componen
 
 Example:
 ```bash
-cmake --preset=debug -DWRP_CORE_ENABLE_CTE=ON -DWRP_CORE_ENABLE_CAE=OFF
+cmake --preset=debug -DCLIO_CORE_ENABLE_CTE=ON -DCLIO_CORE_ENABLE_CAE=OFF
 ```
 
 ### Compilation Standards
 - Always use the debug CMakePreset when compiling code in this repo
 - Never hardcode paths in CMakeLists.txt files
 - Use find_package() for all dependencies
-- Follow Module build patterns from MODULE_DEVELOPMENT_GUIDE.md
+- Follow Module build patterns from the module development guide (docs/docs/sdk/context-runtime/2.module_dev_guide.md)
 - All compilation warnings have been resolved as of the current state
 
 ### RPATH Configuration
@@ -284,7 +382,7 @@ The build system uses **relative RPATHs** (`$ORIGIN`) for portable, relocatable 
 - **Linux**: Uses `$ORIGIN` and `$ORIGIN/../lib` so libraries and binaries find siblings at runtime
 - **macOS**: Uses `@loader_path` and `@loader_path/../lib` (equivalent to `$ORIGIN`)
 - Works for all deployment targets: system installs, pip wheels, conda packages, and relocatable builds
-- **Disable RPATH**: Set `-DWRP_CORE_ENABLE_RPATH=OFF` if you prefer using `LD_LIBRARY_PATH`
+- **Disable RPATH**: Set `-DCLIO_CORE_ENABLE_RPATH=OFF` if you prefer using `LD_LIBRARY_PATH`
 
 ### CTP Usage
 
@@ -292,7 +390,7 @@ Always use CTP_MCTX macro unless we are writing GPU code, which necessitates a s
 
 ### Module Build Patterns
 
-This project follows the CLIO Runtime MODULE_DEVELOPMENT_GUIDE.md patterns for proper Module development:
+This project follows the CLIO Runtime module development guide (docs/docs/sdk/context-runtime/2.module_dev_guide.md) patterns for proper Module development:
 
 **Required Packages for Module Development:**
 ```cmake
@@ -995,7 +1093,7 @@ This documentation covers:
 ### External Integration Test
 A standalone external integration test is available at: `context-transfer-engine/test/unit/external/`
 
-This test demonstrates MODULE_DEVELOPMENT_GUIDE.md compliant patterns:
+This test demonstrates patterns compliant with the module development guide (docs/docs/sdk/context-runtime/2.module_dev_guide.md):
 - Modern find_package() usage for Module discovery
 - Proper target linking with namespace::module_type aliases
 - Automatic dependency resolution through Module targets
@@ -1049,7 +1147,7 @@ echo "CMake cleanup completed!"
 
 When creating or modifying Modules (CLIO Runtime modules), refer to the comprehensive module development guide:
 
-**📖 See [context-transport-primitives/docs/MODULE_DEVELOPMENT_GUIDE.md](context-transport-primitives/docs/MODULE_DEVELOPMENT_GUIDE.md) for complete Module development documentation**
+**📖 See [docs/docs/sdk/context-runtime/2.module_dev_guide.md](docs/docs/sdk/context-runtime/2.module_dev_guide.md) for complete Module development documentation**
 
 This guide covers:
 - Module structure and architecture
